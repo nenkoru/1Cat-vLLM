@@ -54,13 +54,17 @@ def main():
     parser.add_argument("--seats", required=True, type=int)
     parser.add_argument("--context", required=True, type=int)
     parser.add_argument("--name", required=True)
+    parser.add_argument("--timeout", type=int, default=1800,
+                        help="request deadline including queued cold prefill, seconds")
     args = parser.parse_args()
     if not 0 < args.clients <= args.seats <= 32:
         parser.error("profile requires all clients to fit into the seat limit")
+    if args.timeout <= 0:
+        parser.error("timeout must be positive")
     dest = args.profile_dir / args.name
     dest.mkdir(exist_ok=False)
     before = set(args.profile_dir.glob("*.json*"))
-    client = ObservedClient(args.url, args.model, 600)
+    client = ObservedClient(args.url, args.model, args.timeout)
     prompts = []
     for index in range(args.clients):
         rng = random.Random(f"rusl1873-{args.context}-{index}")
@@ -70,6 +74,7 @@ def main():
             raise ValueError("short tokenized prompt")
         prompts.append(ids[:args.context])
     warmup = client.round(prompts, 1)
+    (dest / "warmup.json").write_text(json.dumps(warmup, indent=2))
     if not warmup["valid"]:
         raise RuntimeError(f"warmup invalid: {warmup['errors']}")
     client.first_threads.clear()
@@ -84,6 +89,7 @@ def main():
             time.sleep(.05)
         time.sleep(.5)
         state = {"clients": args.clients, "seats": args.seats, "context": args.context,
+                 "request_timeout_s": args.timeout,
                  "streams_started": len(client.first_threads),
                  "metrics_at_start": client.metrics()}
         try:
@@ -103,7 +109,7 @@ def main():
         state["round"] = future.result()
     for path in set(args.profile_dir.glob("*.json*")) - before:
         shutil.move(str(path), dest / path.name)
-    state["traces"] = [p.name for p in dest.iterdir()]
+    state["traces"] = [p.name for p in dest.glob("*.pt.trace.json*")]
     (dest / "window.json").write_text(json.dumps(state, indent=2))
     if not state["traces"] or state["streams_finished_before_stop"] or not state["round"]["valid"]:
         raise RuntimeError("invalid profile window; inspect saved evidence")

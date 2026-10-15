@@ -2,6 +2,7 @@
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+import time
 import unittest
 
 from concurrency import Client, COUNTERS, metric_values, summarize
@@ -33,6 +34,30 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class ConcurrencyTest(unittest.TestCase):
+    def test_profile_cold_prefill_needs_adequate_request_deadline(self):
+        class Delayed(Handler):
+            def do_POST(self):
+                time.sleep(.15)
+                try:
+                    super().do_POST()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Delayed) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_port}"
+                short = ObservedClient(url, "test", .03).round([[1, 2]], 1)
+                self.assertFalse(short["valid"])
+                self.assertTrue(any("timed out" in x for x in short["errors"]))
+                enough = ObservedClient(url, "test", 1).round([[1, 2]], 1)
+                self.assertTrue(enough["valid"], enough)
+                self.assertEqual(enough["rows"][0]["completion_tokens"], 1)
+            finally:
+                server.shutdown()
+                thread.join()
+
     def test_usage_counts_not_stream_chunks(self):
         with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
             thread = threading.Thread(target=server.serve_forever)
