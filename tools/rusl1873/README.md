@@ -15,7 +15,8 @@ copies/sampling 0.49, graph gaps 0.61, outside-graph gaps 0.12.
 These profiler kernel sums and the unprofiled step are different measurements;
 they must not be summed as an exact decomposition. The b/a prototype's reported
 0.40 ms saving was below the predeclared 2% step gate. It was not deployed.
-There are no 24/32-seat candidate measurements yet, nor 16/24/32 × 33k profiles.
+There are no complete 24/32-seat candidate matrices yet. New profiles are
+reported below; the full 16/24/32 × 8k/33k profile set remains incomplete.
 
 The new `.5` production baseline (16 seats, QPN2 enabled, TP2 V100-SXM2 32 GB)
 completed on 15.10.2026 around 19:26 MSK. Three rounds per stage, 128 completion
@@ -52,8 +53,74 @@ were valid with zero errors/preemptions. Median round throughput and p90:
 These are two single server arms, not A/B/B/A and not a seat-limit result. Both
 servers have 16 seats. They quantify why the QPN2 guard must be accounted for
 when testing 24/32 seats. The corrected comparator independently revalidated
-all 48 warmup/measurement records without changing the raw data. Both traces
-of actual decode and candidate configurations remain separate pending work.
+all 48 warmup/measurement records without changing the raw data. Candidate configurations remain separate pending work; profiler evidence is
+reported below.
+
+## Verified 32-row profile, 15.10.2026
+
+The `.5` wheel, 32 seats and QPN2 disabled completed the 8k profile on both
+ranks. The observation window had 32 running requests, zero waiting requests,
+32 streams with first output and none finished before profiling stopped. Both
+rank traces contain 1,920 GDN calls (40 steps × 48 layers), all with grid
+`[24, 32, 8]` and block `[32, 2, 1]`. The kernel maps `blockIdx.y` to the token
+row. Geometry and stream lifetime evidence together support actual 32-row decode.
+The completed request round had zero errors/preemptions and 1,024 output tokens
+per request. Profiling overhead means these client metrics are not an acceptance
+benchmark.
+
+| Per-step quantity, ms | Rank 0 | Rank 1 |
+|---|---:|---:|
+| Median graph-to-graph period | 46.553 | 46.550 |
+| Mean NVFP4 GEMM kernel durations | 23.020 | 22.973 |
+| Mean attention kernel durations | 12.212 | 12.210 |
+| Mean GDN + convolution kernel durations | 4.067 | 4.079 |
+| Mean all-reduce kernel durations | 2.505 | 2.556 |
+| Mean normalization / activation / quantization | 1.955 | 1.958 |
+| Mean b/a FP16 projection kernel durations | 0.689 | 0.684 |
+| Mean graph idle intervals | 0.549 | 0.545 |
+| Mean outside-graph idle intervals | 0.118 | 0.114 |
+
+The analyzer uses 39 adjacent graph intervals from 40 captured steps (it omits
+the final incomplete interval, not both boundaries). Kernel duration sums can
+double-count overlap and are not an additive critical-path decomposition.
+This QPN2-off profile cannot establish improvement over the 16-seat/QPN2-on
+production configuration or rank proposed kernels by end-to-end benefit alone.
+
+The initial 32 × 33k cold warmup exceeded the profiler client's hard-coded
+600-second timeout: eight requests timed out while the server continued draining
+the queue. This is category **(Б)**, a harness limit. The client now accepts a
+positive `--timeout` (default 1800), saves `warmup.json` before validation, and
+records the timeout in the profile window. A real delayed HTTP response test
+reproduces the short-timeout failure and verifies success with sufficient time.
+The outer rental controller deadline remains independent and takes precedence.
+
+The single repaired 32 × 33k retry completed at 20:35 MSK, exit 0.
+Cold warmup took 620.659 seconds, directly exceeding the old 600-second limit.
+Warmup and the subsequent profile round were both valid. Both ranks
+again show 1,920 GDN calls with grid `[24,32,8]`; all 32 streams were active,
+none finished during the profile window, and errors/preemptions were zero.
+
+| Per-step quantity, ms | Rank 0 | Rank 1 |
+|---|---:|---:|
+| Median graph-to-graph period, 33k | 78.280 | 78.278 |
+| Mean graph-to-graph period, 33k | 79.367 | 79.361 |
+| Mean attention kernel durations | 44.660 | 44.635 |
+| Mean NVFP4 GEMM kernel durations | 23.324 | 23.285 |
+| Mean GDN + convolution kernel durations | 4.075 | 4.081 |
+| Mean all-reduce kernel durations | 2.529 | 2.626 |
+| Mean normalization / activation / quantization | 1.993 | 1.965 |
+| Mean graph idle intervals | 0.549 | 0.542 |
+
+Long-context attention is the largest measured component at 32 rows. This
+supports prioritizing batched attention/cache work alongside GEMM; it does not
+prove a persistent-kernel speedup or disprove smaller fused phases. The full
+24/32-seat A/B/B/A throughput matrix, 16/24-row profiles, numerical/quality
+qualification and a new batched fused prototype remain outstanding.
+
+The complete profile archive was exported and checksum-matched at 20:36 MSK
+(SHA256 `560153552631409cacd846be1bd1cfd8daaacb2b3d4e140979ee0f898f0e7468`).
+The allocated pair was released at 20:37 MSK after independent checks found
+zero owned processes and 0 MiB on both GPUs. No additional rental runs follow.
 
 ## Source audit and actual SM70 compilation
 
@@ -78,6 +145,17 @@ The initial OpenJet probe omitted the `mk_cuda` namespace and failed in our
 harness. That was corrected before the ptxas result above. It is not an upstream
 failure. Full OpenJet build/benchmark is not claimed. Its single-session engine
 experiment remains withdrawn; the architecture is still useful for analysis.
+
+A subsequent full extension build also succeeded in cluster job `kj-fc29ba18`
+(exit 0): upstream `setup.py build_ext --inplace`, PyTorch `2.7.1+cu128`,
+Python 3.11, CUDA 12.8, `MEGAKERNEL_CUDA_ARCH=sm_70`, 80 blocks and two build
+workers. Both CUDA units and `torch_bindings.cpp` compiled and linked; importing
+`qwen35_megakernel_bf16_C` and resolving its `decode` operator succeeded.
+The resulting shared object SHA256 was
+`ebf2932dc79456b69bb6d06f4a8a4c306f01b90bdafb9526b1486ff63917809e`.
+This CPU build/import check did not execute kernels or load model weights.
+The V100 `bench.py`, numerical comparison and 27B adaptation remain open;
+this Python 3.11 artifact is not a production Python 3.12 wheel.
 
 | Component | Reusable part | Work for 27B / NVFP4 / TP2 / batch |
 |---|---|---|
@@ -188,6 +266,6 @@ percentiles; preserve raw arm files to inspect restart variance. A performance
 pass never implies the separate quality gate or rollout approval.
 
 Local validation: `python -m unittest discover -s tools/rusl1873`.
-Thirteen tests exercise multithreaded real HTTP streaming, multi-token chunks,
+Fourteen tests exercise multithreaded real HTTP streaming, multi-token chunks,
 missing/short usage, absent/reset counters, tail-latency accounting, profile
 stream lifetimes, and acceptance rejection for partial/mismatched/regressed data.
