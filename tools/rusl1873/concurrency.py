@@ -11,10 +11,12 @@ import hashlib
 import http.client
 import json
 import math
+import os
 from pathlib import Path
 import random
 import re
 import statistics
+import tempfile
 import threading
 import time
 from urllib.parse import urlsplit
@@ -23,6 +25,27 @@ from urllib.parse import urlsplit
 COUNTERS = ("vllm:num_preemptions_total",)
 GAUGES = ("vllm:num_requests_running", "vllm:num_requests_waiting")
 WORDS = "ledger stock parcel route cache worker batch queue token order".split()
+
+
+def checkpoint(path, result):
+    """Publish a whole JSON snapshot; interruption preserves the previous one.
+
+    Partial matrices remain partial evidence, never resumable server arms.
+    The controller must give a restarted server a new arm identity/output path.
+    """
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(result, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def metric_values(text, names):
@@ -201,7 +224,7 @@ def main():
               "settings": {"contexts": args.contexts, "clients": args.clients,
                            "rounds": args.rounds, "tokens": args.tokens}, "stages": []}
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(result, indent=2) + "\n")
+    checkpoint(args.out, result)
     valid = True
     for context in args.contexts:
         # Same prompt IDs across arms and offered concurrency. No private data.
@@ -219,16 +242,17 @@ def main():
                      "prompt_sha256": hashlib.sha256(json.dumps(selected).encode()).hexdigest(),
                      "warmup": client.round(selected, 1), "rounds": []}
             result["stages"].append(stage)
+            checkpoint(args.out, result)
             valid = valid and stage["warmup"]["valid"]
             if stage["warmup"]["valid"]:
                 for _ in range(args.rounds):
                     measured = client.round(selected, args.tokens)
                     stage["rounds"].append(measured)
                     valid = valid and measured["valid"]
-                    args.out.write_text(json.dumps(result, indent=2) + "\n")
+                    checkpoint(args.out, result)
                     if not measured["valid"]:
                         break
-            args.out.write_text(json.dumps(result, indent=2) + "\n")
+            checkpoint(args.out, result)
             print(json.dumps({"context": context, "clients": count, "valid_so_far": valid}), flush=True)
             if not valid:
                 return 1

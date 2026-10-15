@@ -266,6 +266,16 @@ percentiles; preserve raw arm files to inspect restart variance. A performance
 pass never implies the separate quality gate or rollout approval.
 
 Local validation: `python -m unittest discover -s tools/rusl1873`.
-Fourteen tests exercise multithreaded real HTTP streaming, multi-token chunks,
+Sixteen tests exercise multithreaded real HTTP streaming, multi-token chunks,
 missing/short usage, absent/reset counters, tail-latency accounting, profile
 stream lifetimes, and acceptance rejection for partial/mismatched/regressed data.
+
+Checkpoint preparation for a yielding night slot: each completed warmup and
+measurement round is published by an atomic file replacement, after flushing
+the new file. Interrupted writes retain the preceding readable JSON snapshot.
+A partial arm remains incomplete evidence: a restarted server must use a new
+arm identity/output path; do not merge rounds across restarts. The new tests
+cover failed writes and interruption between warmup and the first measurement.
+This prepares evidence retention only; the night controller, production
+restoration and priority barrier are separate prerequisites, not implemented
+by the client.
