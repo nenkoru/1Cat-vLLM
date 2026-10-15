@@ -37,6 +37,24 @@ rate. HTTP concurrency is not proof of the number of active kernel rows. The
 remaining candidate/restart comparisons, separate profiles and quality gates
 are still required; this single baseline is not an acceptance result.
 
+The matched 16-seat/QPN2-off control completed around 19:53 MSK; all 18 rounds
+were valid with zero errors/preemptions. Median round throughput and p90:
+
+| Input tokens | Clients | QPN2 on, tok/s | QPN2 off, tok/s | Off vs on | Off p90, s |
+|---|---:|---:|---:|---:|---:|
+| 8,000 | 16 | 284.14 | 277.14 | −2.46% | 7.37 |
+| 8,000 | 24 | 256.10 | 245.62 | −4.09% | 12.49 |
+| 8,000 | 32 | 284.91 | 276.64 | −2.90% | 14.77 |
+| 33,000 | 16 | 133.28 | 128.34 | −3.70% | 15.95 |
+| 33,000 | 24 | 126.87 | 121.72 | −4.06% | 25.19 |
+| 33,000 | 32 | 133.76 | 128.79 | −3.72% | 31.73 |
+
+These are two single server arms, not A/B/B/A and not a seat-limit result. Both
+servers have 16 seats. They quantify why the QPN2 guard must be accounted for
+when testing 24/32 seats. The corrected comparator independently revalidated
+all 48 warmup/measurement records without changing the raw data. Both traces
+of actual decode and candidate configurations remain separate pending work.
+
 ## Source audit and actual SM70 compilation
 
 Pinned sources inspected on 15.10.2026:
