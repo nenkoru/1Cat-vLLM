@@ -130,6 +130,19 @@ Use both ranks, label profiler overhead, report milliseconds and percentages,
 and distinguish overlapped kernel sums from critical-path time. Warm full-turn
 latency from this client cannot substitute for that kernel profile.
 
-Local client validation: `python -m unittest discover -s tools/rusl1873`.
-Five tests exercise multithreaded real HTTP streaming, multi-token chunks,
-missing/short usage, absent/reset counters, and tail-latency accounting.
+`profile_concurrency.py` observes each stream's first content and completion,
+rejects a window if any stream finishes before recording stops, and captures
+the configured 40-iteration trace separately from the latency matrix. The
+trace analysis must still verify both ranks and graph shapes.
+
+`compare_concurrency.py A1.json B1.json B2.json A2.json --out comparison.json`
+requires a complete matrix, at least three rounds, matching workload/prompt
+identity, wheel/model/GPU identity and repeated-arm argv. It rejects partial
+measurements. It reports per-round throughput as well as pooled latency
+percentiles; preserve raw arm files to inspect restart variance. A performance
+pass never implies the separate quality gate or rollout approval.
+
+Local validation: `python -m unittest discover -s tools/rusl1873`.
+Ten tests exercise multithreaded real HTTP streaming, multi-token chunks,
+missing/short usage, absent/reset counters, tail-latency accounting, profile
+stream lifetimes, and acceptance rejection for partial/mismatched/regressed data.
