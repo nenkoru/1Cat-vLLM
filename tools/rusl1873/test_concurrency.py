@@ -5,6 +5,7 @@ import threading
 import unittest
 
 from concurrency import Client, COUNTERS, metric_values, summarize
+from profile_concurrency import ObservedClient
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -52,6 +53,20 @@ class ConcurrencyTest(unittest.TestCase):
                                "vllm:num_preemptions_total{rank=\"1\"} 2\n", COUNTERS + ("absent",))
         self.assertEqual(values[COUNTERS[0]], 5)
         self.assertIsNone(values["absent"])
+
+    def test_profile_observer_tracks_each_started_and_finished_stream(self):
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                client = ObservedClient(f"http://127.0.0.1:{server.server_port}", "test", 5)
+                result = client.round([[1, 2], [3, 4]], 128)
+                self.assertTrue(result["valid"], result)
+                self.assertEqual(len(client.first_threads), 2)
+                self.assertEqual(len(client.finished_threads), 2)
+            finally:
+                server.shutdown()
+                thread.join()
 
     def test_missing_or_short_usage_fails(self):
         for row in [{}, {"completion_tokens": 127}, {"error": "HTTP 500"}]:
