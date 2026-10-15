@@ -2,8 +2,8 @@
 
 The current target is aggregate throughput and full warm turn latency at 16,
 24 and 32 concurrent sessions, with 8,000 and 33,000 input tokens. The earlier
-single-session fast-lane proposal was withdrawn. No new GPU performance result
-is claimed by this change.
+single-session fast-lane proposal was withdrawn. The first production baseline
+is measured below; no candidate improvement is claimed.
 
 ## Evidence already available
 
@@ -15,7 +15,27 @@ copies/sampling 0.49, graph gaps 0.61, outside-graph gaps 0.12.
 These profiler kernel sums and the unprofiled step are different measurements;
 they must not be summed as an exact decomposition. The b/a prototype's reported
 0.40 ms saving was below the predeclared 2% step gate. It was not deployed.
-There are no 24/32-session measurements yet, nor 16/24/32 × 33k profiles.
+There are no 24/32-seat candidate measurements yet, nor 16/24/32 × 33k profiles.
+
+The new `.5` production baseline (16 seats, QPN2 enabled, TP2 V100-SXM2 32 GB)
+completed on 15.10.2026 around 19:26 MSK. Three rounds per stage, 128 completion
+tokens; throughput is the median of the rounds. Every round was valid, with
+zero request errors/preemptions.
+
+| Input tokens | Offered clients | Completion tok/s | Full-turn p90 range, s |
+|---|---:|---:|---:|
+| 8,000 | 16 | 284.14 | 7.19–7.20 |
+| 8,000 | 24 | 256.10 | 11.95–11.99 |
+| 8,000 | 32 | 284.91 | 14.33–14.34 |
+| 33,000 | 16 | 133.28 | 15.34–15.41 |
+| 33,000 | 24 | 126.87 | 24.15–24.27 |
+| 33,000 | 32 | 133.76 | 30.53–30.56 |
+
+Cached input tokens were 7,680/8,000 and 32,256/33,000. These full turns include
+the recomputed prompt tail and queueing; they are not the earlier pure-decode
+rate. HTTP concurrency is not proof of the number of active kernel rows. The
+remaining candidate/restart comparisons, separate profiles and quality gates
+are still required; this single baseline is not an acceptance result.
 
 ## Source audit and actual SM70 compilation
 
@@ -136,13 +156,20 @@ the configured 40-iteration trace separately from the latency matrix. The
 trace analysis must still verify both ranks and graph shapes.
 
 `compare_concurrency.py A1.json B1.json B2.json A2.json --out comparison.json`
-requires a complete matrix, at least three rounds, matching workload/prompt
-identity, wheel/model/GPU identity and repeated-arm argv. It rejects partial
+requires a complete matrix, 128 output tokens, at least three rounds, matching
+workload/prompt identity, wheel/model/GPU identity and repeated-arm argv. Each
+manifest must have a distinct nonempty `arm` and timezone-qualified
+`started_msk`; those recorded server starts must follow A/B/B/A chronology.
+The operator verifies that they identify independent server runs. Reusing paths
+or run identities, including copied JSON, is rejected. Missing identities are
+not equality. The comparator checks every request's usage, errors and finite
+timings, checks zero preemptions in every round, and recomputes saved aggregates
+from rows/counters/elapsed time. It rejects partial or inconsistent
 measurements. It reports per-round throughput as well as pooled latency
 percentiles; preserve raw arm files to inspect restart variance. A performance
 pass never implies the separate quality gate or rollout approval.
 
 Local validation: `python -m unittest discover -s tools/rusl1873`.
-Ten tests exercise multithreaded real HTTP streaming, multi-token chunks,
+Thirteen tests exercise multithreaded real HTTP streaming, multi-token chunks,
 missing/short usage, absent/reset counters, tail-latency accounting, profile
 stream lifetimes, and acceptance rejection for partial/mismatched/regressed data.
