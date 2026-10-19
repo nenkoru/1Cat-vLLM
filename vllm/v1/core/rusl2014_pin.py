@@ -10,6 +10,10 @@ Score of a block hash: the number of prefix hits on it, halved every ``half_life
 the history of one session gathers one hit per turn, and the blocks of a one-shot request gather none. The score
 lives with the hash, not with the block: a hot prefix that was evicted anyway is hot again as soon as it is cached.
 
+One hit is enough by default: the GDN state at the boundary a session reached is hit exactly once (by its next
+turn), and without it the hit of a hybrid model falls back to an older state; blocks of one-shot requests get no hit
+at all and are never pinned.
+
 When a cached block is freed (``ref_cnt`` reaches 0) and its score is at least ``min_hits``, it is pinned instead of
 being appended to the free queue, up to ``budget`` blocks; a hotter block displaces the coldest pinned one (which
 goes back to the queue like any freed block). Pinned blocks:
@@ -23,7 +27,7 @@ goes back to the queue like any freed block). Pinned blocks:
 
 Switch: ``VLLM_KV_PIN_HOT=1`` (default ``0``: no object is created, the block pool behaves as before).
   ``VLLM_KV_PIN_HOT_BLOCKS`` — budget, blocks or percent of the pool (default ``10%``);
-  ``VLLM_KV_PIN_HOT_MIN_HITS`` — score needed to pin (default 2);
+  ``VLLM_KV_PIN_HOT_MIN_HITS`` — score needed to pin (default 1);
   ``VLLM_KV_PIN_HOT_HALF_LIFE_S`` — half-life of the score (default 900);
   ``VLLM_KV_PIN_HOT_IDLE_S`` — release a pinned block without hits for this long (default 1800);
   ``VLLM_KV_PIN_HOT_LOG_S`` — period of the counters line in the log (default 60).
@@ -67,7 +71,7 @@ class HotPins:
     def __init__(
         self,
         budget: int,
-        min_hits: float = 2.0,
+        min_hits: float = 1.0,
         half_life_s: float = 900.0,
         idle_s: float = 1800.0,
         log_s: float = 60.0,
@@ -106,7 +110,7 @@ class HotPins:
         )
         pins = cls(
             budget=budget,
-            min_hits=float(os.environ.get(f"{ENV}_MIN_HITS", "2")),
+            min_hits=float(os.environ.get(f"{ENV}_MIN_HITS", "1")),
             half_life_s=float(os.environ.get(f"{ENV}_HALF_LIFE_S", "900")),
             idle_s=float(os.environ.get(f"{ENV}_IDLE_S", "1800")),
             log_s=float(os.environ.get(f"{ENV}_LOG_S", "60")),

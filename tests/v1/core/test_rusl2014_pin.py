@@ -59,7 +59,7 @@ def test_switch_on_from_env(monkeypatch):
     monkeypatch.setenv("VLLM_KV_PIN_HOT", "1")
     monkeypatch.setenv("VLLM_KV_PIN_HOT_BLOCKS", "25%")
     pool = BlockPool(num_gpu_blocks=100, enable_caching=True, hash_block_size=16)
-    assert pool._pins is not None and pool._pins.budget == 25
+    assert pool._pins is not None and pool._pins.budget == 25 and pool._pins.min_hits == 1.0
     # no prefix caching, nothing to pin
     assert BlockPool(num_gpu_blocks=100, enable_caching=False, hash_block_size=16)._pins is None
     assert _parse_budget("7", 100) == 7 and _parse_budget("200%", 10) == 9
