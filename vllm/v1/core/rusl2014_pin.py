@@ -10,11 +10,13 @@ Score of a block hash: the number of prefix hits on it, halved every ``half_life
 the history of one session gathers one hit per turn, and the blocks of a one-shot request gather none. The score
 lives with the hash, not with the block: a hot prefix that was evicted anyway is hot again as soon as it is cached.
 
-One hit is enough by default: the GDN state at the boundary a session reached is hit exactly once (by its next
-turn), and without it the hit of a hybrid model falls back to an older state; blocks of one-shot requests get no hit
-at all and are never pinned.
+One hit is enough by default. The newest GDN state of a session (made by its last turn) has no hit yet and is not
+pinned; the state that turn started from has one hit and is. Under pressure the next turn of a hybrid model then
+falls back by one turn instead of to the system prompt (or to nothing). Blocks of one-shot requests get no hit at
+all and are never pinned.
 
-When a cached block is freed (``ref_cnt`` reaches 0) and its score is at least ``min_hits``, it is pinned instead of
+When a cached block is freed (``ref_cnt`` reaches 0) and its score as of its last hit is at least ``min_hits`` (and
+that hit is younger than ``idle_s``), it is pinned instead of
 being appended to the free queue, up to ``budget`` blocks; a hotter block displaces the coldest pinned one (which
 goes back to the queue like any freed block). Pinned blocks:
 
@@ -130,13 +132,6 @@ class HotPins:
 
     # --- scores ---
 
-    def _score(self, key: Any, now: float) -> float:
-        entry = self._scores.get(key)
-        if entry is None:
-            return 0.0
-        score, t = entry
-        return score * 0.5 ** ((now - t) / self.half_life_s)
-
     def _priority(self, score: float, now: float) -> float:
         # log2 of the score brought to time 0: the order of two decaying scores never changes,
         # so a pinned block (whose score cannot change: a hit unpins it) keeps its heap position.
@@ -208,11 +203,15 @@ class HotPins:
         queue: list[KVCacheBlock] = []
         displaced: list[KVCacheBlock] = []
         for block in blocks:
-            score = self._score(block.block_hash, now)
-            if score < self.min_hits:
+            # The score as of the last hit, not decayed to the moment of the free: a hit
+            # comes at admission and the free a whole turn later, so a decayed single
+            # hit would always be below 1 (review RUSL-2025). Hits older than idle_s
+            # do not count; the decay still orders the pinned blocks (priority).
+            entry = self._scores.get(block.block_hash)
+            if entry is None or entry[0] < self.min_hits or now - entry[1] > self.idle_s:
                 queue.append(block)
                 continue
-            priority = self._priority(score, now)
+            priority = self._priority(entry[0], entry[1])
             if len(self.pinned) >= self.budget:
                 coldest = self._peek_coldest()
                 if coldest is None or coldest[0] >= priority:
@@ -223,9 +222,7 @@ class HotPins:
                 assert displaced_block is not None
                 displaced.append(displaced_block)
                 self.counters["displaced"] += 1
-            entry = self._scores.get(block.block_hash)
-            last_hit = entry[1] if entry is not None else now
-            self.pinned[block.block_id] = (block, priority, last_hit)
+            self.pinned[block.block_id] = (block, priority, entry[1])
             heapq.heappush(self._heap, (priority, block.block_id))
             self.counters["pins"] += 1
         self.max_pinned = max(self.max_pinned, len(self.pinned))

@@ -143,6 +143,24 @@ def test_score_decays(monkeypatch):
     assert pool._pins.is_pinned(b)
 
 
+def test_one_hit_pins_a_turn_later(monkeypatch):
+    # review RUSL-2025: the hit comes at admission, the free a turn later; the threshold is
+    # the score as of the hit, not decayed to the free
+    pool, clock = make_pool(monkeypatch, n=8, budget=2, min_hits=1.0, idle_s=600.0)
+    b, old = pool.get_new_blocks(2)
+    cache(pool, [b, old], "t")
+    pool.free_blocks([b, old])
+    pool.touch([b])
+    clock.t += 30
+    pool.free_blocks([b])
+    assert pool._pins.is_pinned(b)
+    # a hit older than idle_s does not pin
+    pool.touch([old])
+    clock.t += 601
+    pool.free_blocks([old])
+    assert not pool._pins.is_pinned(old)
+
+
 def test_idle_release(monkeypatch):
     pool, clock = make_pool(monkeypatch, n=8, budget=2, idle_s=600.0)
     b, other = pool.get_new_blocks(2)
