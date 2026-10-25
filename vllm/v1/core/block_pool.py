@@ -26,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
     maybe_convert_block_hash,
 )
+from vllm.v1.core.rusl2014_pin import HotPins
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -180,6 +181,12 @@ class BlockPool:
         self.kv_event_queue: list[KVCacheEvent] = []
 
         self.metrics_collector = metrics_collector
+
+        # RUSL-2014: hot prefixes pinned out of the eviction queue (VLLM_KV_PIN_HOT=1);
+        # None keeps the pool exactly as before.
+        self._pins: HotPins | None = (
+            HotPins.from_env(num_gpu_blocks) if enable_caching else None
+        )
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -342,6 +349,8 @@ class BlockPool:
         """
         if num_blocks > self.get_num_free_blocks():
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        if self._pins is not None:
+            self.reclaim_pinned(num_blocks)
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
 
@@ -406,12 +415,17 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        pins = self._pins
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
-                self.free_block_queue.remove(block)
+                # RUSL-2014: a pinned block is not in the queue.
+                if pins is None or not pins.take(block):
+                    self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            if pins is not None and not block.is_null:
+                pins.on_hit(block)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -451,13 +465,21 @@ class BlockPool:
                     if reuse_first or block.block_hash is None
                 ]
             )
-            self.free_block_queue.append_n(
-                [
-                    block
-                    for block in freed_blocks
-                    if not reuse_first and block.block_hash is not None
-                ]
-            )
+            cached_blocks = [
+                block
+                for block in freed_blocks
+                if not reuse_first and block.block_hash is not None
+            ]
+            pins = self._pins
+            if pins is not None:
+                # RUSL-2014: hot blocks are pinned instead of queued; displaced and
+                # idle pinned blocks go back to the queue.
+                cached_blocks, displaced = pins.offer(cached_blocks)
+                self.free_block_queue.prepend_n(pins.sweep_idle())
+                if displaced:
+                    self.free_block_queue.append_n(displaced)
+                pins.maybe_log()
+            self.free_block_queue.append_n(cached_blocks)
         else:
             self.free_block_queue.append_n(freed_blocks)
 
@@ -478,6 +500,9 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
+            if self._pins is not None and self._pins.drop(block):
+                # RUSL-2014: a pinned block without its hash is plain free space.
+                self.free_block_queue.prepend_n([block])
             self._maybe_evict_cached_block(block)
 
     def reset_prefix_cache(self) -> bool:
@@ -489,6 +514,9 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        if self._pins is not None:
+            # RUSL-2014: pinned blocks are free; the reset clears them like the queue.
+            self.free_block_queue.append_n(self._pins.release_all())
         num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
@@ -521,7 +549,22 @@ class BlockPool:
         Returns:
             The number of free blocks.
         """
+        if self._pins is not None:
+            # RUSL-2014: pinned blocks are evictable as a last resort
+            # (reclaim_pinned), so they count as free.
+            return self.free_block_queue.num_free_blocks + len(self._pins.pinned)
         return self.free_block_queue.num_free_blocks
+
+    def reclaim_pinned(self, num_blocks: int) -> None:
+        """RUSL-2014: make the queue alone serve ``num_blocks``: unpin the coldest
+        pinned blocks to its head when it is short. Hooks that look at the queue
+        head before an allocation (store-on-evict) call this first."""
+        pins = self._pins
+        if pins is None:
+            return
+        short = num_blocks - self.free_block_queue.num_free_blocks
+        if short > 0:
+            self.free_block_queue.prepend_n(pins.reclaim(short))
 
     def get_usage(self) -> float:
         """Get the KV cache usage.
