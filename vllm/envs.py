@@ -346,6 +346,7 @@ if TYPE_CHECKING:
     VLLM_SM70_NVFP4_QPN2_PREFILL: bool = False
     VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY: str | None = None
     VLLM_SM70_NVFP4_QPN2_PREFILL_MIN_M: int = 1024
+    VLLM_SM70_MODELOPT_FP8_PART_SCALES: bool = False
     VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES: bool = True
     VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR: bool = True
@@ -4097,6 +4098,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         automatic_conditions=(),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
+    ),
+    # RUSL-2040: fused ModelOpt FP8 projections (GDN qkvz, attention qkv) keep
+    # the scale of every checkpoint partition instead of the requantization to
+    # the largest one.
+    "VLLM_SM70_MODELOPT_FP8_PART_SCALES": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MODELOPT_FP8_PART_SCALES", "0"))),
+        description=(
+            "SM70: a fused ModelOpt FP8 linear on TurboMind whose partitions "
+            "have their own checkpoint scales keeps the checkpoint codes and "
+            "gets one 128x128 block scale per partition, instead of a weight "
+            "requantized to the largest partition scale. Same kernel and the "
+            "same memory; applies when every partition is a whole number of "
+            "128-row blocks, other layers keep the requantization."
+        ),
+        category="configuration",
+        declared_default="False",
+        effective_default=(
+            "False; fused ModelOpt FP8 linears are requantized to the max "
+            "partition scale."
+        ),
+        automatic_conditions=(),
+        acceleration_paths=("ModelOptFp8LinearMethod",),
     ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP

@@ -50,6 +50,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
+from vllm.model_executor.layers.quantization import (
+    sm70_modelopt_fp8_part_scales as sm70_part_scales,
+)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -538,9 +541,16 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # RUSL-2040: with the switch a fused TurboMind layer keeps its
+        # checkpoint codes and one block scale per partition.
+        part_rows = None
+        if self.use_sm70_fp8_turbomind and sm70_part_scales.enabled():
+            part_rows = sm70_part_scales.row_scales(layer)
         weight = layer.weight
         max_w_scale = layer.weight_scale.max()
-        if not (layer.weight_scale == layer.weight_scale[0]).all():
+        if part_rows is None and not (
+            layer.weight_scale == layer.weight_scale[0]
+        ).all():
             max_w_scale, weight = requantize_with_max_scale(
                 layer.weight, layer.weight_scale, layer.logical_widths
             )
@@ -562,9 +572,20 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             block_size = 128
             out_blocks = (weight.shape[0] + block_size - 1) // block_size
             in_blocks = (weight.shape[1] + block_size - 1) // block_size
-            block_scales = (
-                max_w_scale.reshape(1, 1).expand(out_blocks, in_blocks).contiguous()
-            )
+            if part_rows is not None:
+                block_scales = sm70_part_scales.block_scales(
+                    part_rows, weight.shape[1], block_size
+                )
+                logger.info_once(
+                    "RUSL-2040: SM70 ModelOpt FP8 fused linears keep their "
+                    "per-partition checkpoint scales."
+                )
+            else:
+                block_scales = (
+                    max_w_scale.reshape(1, 1)
+                    .expand(out_blocks, in_blocks)
+                    .contiguous()
+                )
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 weight, block_scales, block_size
             )
