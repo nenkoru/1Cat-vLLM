@@ -2013,7 +2013,13 @@ class Scheduler(SchedulerInterface):
             # This is a rare case and unlikely to impact performance.
             self.waiting.remove_requests(stopped_preempted_reqs)
 
-        if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
+        # Under the recompute policy, failed_kv_load_req_ids holds only running
+        # requests; for hybrid models they cannot be rescheduled and are failed
+        # as well (see _handle_invalid_blocks).
+        if failed_kv_load_req_ids and (
+            not self.recompute_kv_load_failures
+            or len(self.kv_cache_config.kv_cache_groups) > 1
+        ):
             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
@@ -2796,8 +2802,7 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            group_block_ids = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
@@ -2807,6 +2812,31 @@ class Scheduler(SchedulerInterface):
             req_num_computed_blocks = (
                 req_num_computed_tokens + self.block_size - 1
             ) // self.block_size
+
+            if len(group_block_ids) > 1:
+                # Hybrid memory allocator (e.g. attention + Mamba or sliding
+                # window groups). The non-full-attention groups only cover the
+                # end of the loaded prefix (e.g. the Mamba state), so the
+                # request cannot resume from the longest valid prefix:
+                # recompute it from scratch.
+                invalid_blocks_found = False
+                for req_block_ids in group_block_ids:
+                    for idx, block_id in zip(
+                        range(req_num_computed_blocks), req_block_ids
+                    ):
+                        if block_id in invalid_block_ids:
+                            invalid_blocks_found = True
+                            # collect invalid block and all downstream blocks
+                            if evict_blocks:
+                                blocks_to_evict.update(req_block_ids[idx:])
+                            break
+                if invalid_blocks_found:
+                    request.num_computed_tokens = 0
+                    total_affected_tokens += req_num_computed_tokens
+                    affected_req_ids.add(req_id)
+                continue
+
+            (req_block_ids,) = group_block_ids
             for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
                 if block_id not in invalid_block_ids:
                     continue
@@ -2867,6 +2897,10 @@ class Scheduler(SchedulerInterface):
             Set of affected request IDs to skip in update_from_output main loop.
         """
         should_fail = not self.recompute_kv_load_failures
+        # Running requests of hybrid models cannot be rescheduled from an
+        # earlier position (e.g. their Mamba state has already advanced), so
+        # their sync load failures are always failed, whatever the policy.
+        should_fail_sync = should_fail or len(self.kv_cache_config.kv_cache_groups) > 1
 
         # handle async KV loads (not cached yet, evict_blocks=False)
         async_load_reqs = (
@@ -2900,9 +2934,9 @@ class Scheduler(SchedulerInterface):
             return set()
 
         # evict invalid blocks and downstream dependent blocks from cache
-        # only when not using recompute policy (where blocks will be recomputed
-        # and reused by other requests sharing them)
-        if sync_blocks_to_evict and not self.recompute_kv_load_failures:
+        # only when the affected requests are failed (otherwise blocks will be
+        # recomputed and reused by other requests sharing them)
+        if sync_blocks_to_evict and should_fail_sync:
             self.kv_cache_manager.evict_blocks(sync_blocks_to_evict)
 
         if should_fail:
@@ -2916,14 +2950,27 @@ class Scheduler(SchedulerInterface):
             )
             return all_failed_req_ids
 
-        logger.warning(
-            "Recovered from KV load failure: "
-            "%d request(s) rescheduled (%d tokens affected).",
-            total_failed_requests,
-            total_failed_tokens,
-        )
+        if should_fail_sync and sync_failed_req_ids:
+            logger.error(
+                "Failing %d running request(s) of a hybrid model due to KV "
+                "load failure (%d tokens affected). Request IDs: %s",
+                len(sync_failed_req_ids),
+                num_failed_tokens,
+                sync_failed_req_ids,
+            )
+            total_failed_requests -= len(sync_failed_req_ids)
+            total_failed_tokens -= num_failed_tokens
+
+        if total_failed_requests:
+            logger.warning(
+                "Recovered from KV load failure: "
+                "%d request(s) rescheduled (%d tokens affected).",
+                total_failed_requests,
+                total_failed_tokens,
+            )
 
         # Mark async requests with KV load failures for retry once loading completes
         self.failed_recving_kv_req_ids |= async_failed_req_ids
-        # Return sync affected IDs to skip in update_from_output
+        # Return sync affected IDs to skip in update_from_output (they are
+        # failed there if should_fail_sync is set)
         return sync_failed_req_ids
