@@ -290,6 +290,9 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self.current_step = 0
+        # The request that is alone in the scheduler and since when, for
+        # long_prefill_token_threshold_contention_grace_ms. None: not alone.
+        self.lone_request: tuple[str, float] | None = None
         self.scheduler_reserve_full_isl = (
             self.scheduler_config.scheduler_reserve_full_isl
         )
@@ -568,6 +571,28 @@ class Scheduler(SchedulerInterface):
         )
         return max(end - start, 0)
 
+    def _in_lone_request_grace(self, num_eligible_reqs: int, now: float) -> bool:
+        """Whether a lone request is still within its contention grace period.
+
+        Requests sent together reach the scheduler a little apart, so the
+        first one is briefly alone. The grace period keeps the threshold on it
+        until it has been alone for
+        ``long_prefill_token_threshold_contention_grace_ms``. The clock belongs
+        to the request: an idle engine is not scheduled, so a new lone request
+        after a finished one must not inherit its time.
+        """
+        config = self.scheduler_config
+        grace_ms = config.long_prefill_token_threshold_contention_grace_ms
+        if grace_ms <= 0 or num_eligible_reqs != 1:
+            self.lone_request = None
+            return False
+        request_id = next(
+            itertools.chain(self.running, self.waiting, self.skipped_waiting)
+        ).request_id
+        if self.lone_request is None or self.lone_request[0] != request_id:
+            self.lone_request = (request_id, now)
+        return (now - self.lone_request[1]) * 1000 < grace_ms
+
     def schedule(self) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -663,9 +688,12 @@ class Scheduler(SchedulerInterface):
         num_eligible_reqs = (
             len(self.running) + len(self.waiting) + len(self.skipped_waiting)
         )
+        in_lone_grace = self._in_lone_request_grace(
+            num_eligible_reqs, scheduled_timestamp
+        )
         long_prefill_token_threshold = (
             self.scheduler_config.long_prefill_token_threshold
-            if num_eligible_reqs > 1
+            if num_eligible_reqs > 1 or in_lone_grace
             else 0
         )
         if long_prefill_token_threshold > 0 and self.adaptive_long_prefill_threshold:

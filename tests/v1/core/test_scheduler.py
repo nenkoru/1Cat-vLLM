@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -455,6 +456,131 @@ def test_long_prefill_threshold_floored_by_fair_share():
     # 100 is below the fair share (1024 // 2 = 512), so the floor binds.
     assert output.num_scheduled_tokens[long_req.request_id] == 512
     assert output.num_scheduled_tokens[short_req.request_id] == 10
+
+
+class _ManualClock:
+    """``time`` for the scheduler module with a hand-moved ``monotonic``."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self):
+        return self.now
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def _grace_scheduler(monkeypatch, grace_ms, async_scheduling=False):
+    from vllm.v1.core.sched import scheduler as scheduler_module
+
+    clock = _ManualClock()
+    monkeypatch.setattr(scheduler_module, "time", clock)
+    scheduler = create_scheduler(
+        max_num_batched_tokens=512,
+        long_prefill_token_threshold=64,
+        async_scheduling=async_scheduling,
+    )
+    scheduler.scheduler_config.long_prefill_token_threshold_contention_grace_ms = (
+        grace_ms
+    )
+    return scheduler, clock
+
+
+def test_long_prefill_threshold_contention_grace_keeps_cap_on_lone_request(
+    monkeypatch,
+):
+    """A lone prefill stays at the threshold for the grace period, then takes
+    the whole budget."""
+    scheduler, clock = _grace_scheduler(monkeypatch, 500)
+    request = create_requests(num_requests=1, num_tokens=4000)[0]
+    scheduler.add_request(request)
+
+    steps = []
+    for advance in [0.0, 0.2, 0.2, 0.2]:
+        clock.now += advance
+        steps.append(scheduler.schedule().num_scheduled_tokens[request.request_id])
+    # 0, 200 and 400 ms alone: capped; 600 ms: the whole budget.
+    assert steps == [64, 64, 64, 512]
+
+
+def test_long_prefill_threshold_contention_grace_burst_with_async_scheduling(
+    monkeypatch,
+):
+    """Requests sent together reach the scheduler a little apart. With async
+    scheduling the first one is alone for the two planned steps: without a
+    grace period both take the whole budget, with one they stay capped."""
+    planned = {}
+    for grace_ms in [0, 500]:
+        scheduler, clock = _grace_scheduler(
+            monkeypatch, grace_ms, async_scheduling=True
+        )
+        first = create_requests(num_requests=1, num_tokens=4000)[0]
+        scheduler.add_request(first)
+        steps = [scheduler.schedule()]
+        clock.now += 0.05
+        steps.append(scheduler.schedule())
+        clock.now += 0.05
+        for request in create_requests(
+            num_requests=3, num_tokens=4000, req_ids=["b", "c", "d"]
+        ):
+            scheduler.add_request(request)
+        steps.append(scheduler.schedule())
+        planned[grace_ms] = [step.num_scheduled_tokens for step in steps]
+
+    assert planned[0][:2] == [{first.request_id: 512}] * 2
+    assert planned[500][:2] == [{first.request_id: 64}] * 2
+    # Once the others are in, every prefill gets the threshold either way.
+    for grace_ms in [0, 500]:
+        assert planned[grace_ms][2] == {
+            first.request_id: 64,
+            "b": 64,
+            "c": 64,
+            "d": 64,
+        }
+
+
+def test_long_prefill_threshold_contention_grace_restarts_after_contention(
+    monkeypatch,
+):
+    """When the other request leaves, the long one waits a new grace period."""
+    scheduler, clock = _grace_scheduler(monkeypatch, 500)
+    long_req = create_requests(num_requests=1, num_tokens=4000)[0]
+    scheduler.add_request(long_req)
+    scheduler.schedule()
+    clock.now += 1.0
+    assert scheduler.schedule().num_scheduled_tokens[long_req.request_id] == 512
+
+    short_req = create_requests(num_requests=1, num_tokens=10, req_ids=["short"])[0]
+    scheduler.add_request(short_req)
+    clock.now += 1.0
+    assert scheduler.schedule().num_scheduled_tokens[long_req.request_id] == 64
+
+    scheduler.finish_requests("short", RequestStatus.FINISHED_ABORTED)
+    clock.now += 0.1
+    assert scheduler.schedule().num_scheduled_tokens[long_req.request_id] == 64
+    clock.now += 0.5
+    assert scheduler.schedule().num_scheduled_tokens[long_req.request_id] == 512
+
+
+def test_long_prefill_threshold_contention_grace_is_per_request(monkeypatch):
+    """An idle engine is not scheduled, so the scheduler may never see an
+    empty queue between two lone requests: the second one must not inherit
+    the time of the first."""
+    scheduler, clock = _grace_scheduler(monkeypatch, 500)
+    first = create_requests(num_requests=1, num_tokens=4000)[0]
+    scheduler.add_request(first)
+    scheduler.schedule()
+    clock.now += 1.0
+    assert scheduler.schedule().num_scheduled_tokens[first.request_id] == 512
+
+    scheduler.finish_requests(first.request_id, RequestStatus.FINISHED_ABORTED)
+    second = create_requests(num_requests=1, num_tokens=4000, req_ids=["second"])[0]
+    scheduler.add_request(second)
+    clock.now += 0.1
+    assert scheduler.schedule().num_scheduled_tokens["second"] == 64
+    clock.now += 0.5
+    assert scheduler.schedule().num_scheduled_tokens["second"] == 512
 
 
 def test_stop_via_update_from_output():

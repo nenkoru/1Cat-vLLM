@@ -91,6 +91,15 @@ class SchedulerConfig:
     and running requests. Only applies when long_prefill_token_threshold is
     nonzero."""
 
+    long_prefill_token_threshold_contention_grace_ms: float = Field(default=0.0, ge=0)
+    """Keep long_prefill_token_threshold on a lone request until it has been
+    the only request in the scheduler for this many milliseconds. Requests
+    sent together reach the scheduler a little apart; without a grace period
+    the first one takes full chunks while the others wait for them. Zero lifts
+    the cap as soon as a request is alone. Has no effect with
+    long_prefill_token_threshold_adaptive, whose floor for a lone request is
+    the whole budget."""
+
     mixed_prefill_step_latency_ms: float = Field(default=250.0, ge=0)
     """GPU step latency target when prefill shares a batch with resident decode.
     The prefill token budget adapts to completed GPU measurements. Pure prefill
