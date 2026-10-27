@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import replace
 from math import lcm
 from typing import NamedTuple
 
+from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -27,6 +29,8 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class KVCacheCoordinator(ABC):
@@ -547,6 +551,15 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 for g in kv_cache_config.kv_cache_groups
             ), "Hybrid DCP requires full-attention shards or replicated cache owners."
         self.verify_and_split_kv_cache_groups()
+        # Only align-mode Mamba groups keep recurrent states at block
+        # boundaries, so only they can trail the attention KV hit.
+        self._log_state_gaps = any(
+            isinstance(g.spec, MambaSpec) and g.spec.mamba_cache_mode == "align"
+            for g in self.attention_groups
+        )
+        # Gaps already reported by _log_state_gap: a waiting request repeats
+        # the same lookup every step.
+        self._logged_state_gaps: set[tuple] = set()
 
     def verify_and_split_kv_cache_groups(self) -> None:
         """
@@ -741,6 +754,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
 
         if longest_hit_length > hit_length:
             self.shared_prefix_boundary = longest_hit_length
+            if self._log_state_gaps and logger.isEnabledFor(logging.DEBUG):
+                self._log_state_gap(
+                    block_hashes, max_cache_hit_length, longest_hit_length, hit_length
+                )
 
         # Truncate full attention blocks to final hit_length (if present)
         first_group = self.attention_groups[0]
@@ -753,6 +770,38 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         return tuple(
             blocks if blocks is not None else [] for blocks in hit_blocks_by_group
         ), hit_length
+
+    def _log_state_gap(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+        kv_hit_length: int,
+        hit_length: int,
+    ) -> None:
+        """Report a lookup where the attention KV matched further than the
+        last cached recurrent state, so the tokens in between are recomputed.
+        Each distinct gap is reported once (the set of seen gaps is bounded).
+        """
+        key = (
+            len(block_hashes),
+            block_hashes[-1] if block_hashes else None,
+            kv_hit_length,
+            hit_length,
+        )
+        if key in self._logged_state_gaps:
+            return
+        if len(self._logged_state_gaps) >= 1024:
+            self._logged_state_gaps.clear()
+        self._logged_state_gaps.add(key)
+        logger.debug(
+            "Hybrid prefix cache hit limited by recurrent state: KV matched %d "
+            "tokens, cached state at %d, %d matched tokens recomputed "
+            "(max hit %d).",
+            kv_hit_length,
+            hit_length,
+            kv_hit_length - hit_length,
+            max_cache_hit_length,
+        )
 
 
 def get_kv_cache_coordinator(
